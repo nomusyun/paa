@@ -1,104 +1,137 @@
 from flask import Flask, render_template, Response, jsonify, request
 from djitellopy import Tello
 import cv2
+import numpy as np
 import time
-import threading
 
-# --- FaceDetectorYN (YuNet) の初期化 ---
-MODEL_PATH = "face_detection_yunet_2023mar.onnx"
-detector = cv2.FaceDetectorYN.create(
-    model=MODEL_PATH,
-    config="",
-    input_size=(640, 480),
-    score_threshold=0.6,
-    nms_threshold=0.3,
-    top_k=5000
-)
+# --- YOLOv8 (Person Detection) の初期化 ---
+MODEL_PATH = "yolov8n.onnx"
+try:
+    net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+except Exception as e:
+    print(f"YOLOモデルの読み込みエラー: {e}")
+    net = None
 
 app = Flask(__name__)
 
 # Telloの初期化と接続
 tello = Tello()
-tello.connect()
-tello.streamon()
+try:
+    tello.connect()
+    tello.streamon()
+except Exception as e:
+    print(f"Tello接続エラー: {e}")
 
 # --- 制御用グローバル変数 ---
 tracking_active = False  # PC画面からの承認による追跡フラグ
 
-def control_drone_to_face(x, y, w, h, frame_width, frame_height):
-    """顔の位置に応じてドローンを旋回・前進後退させる関数"""
+def detect_and_track_person(frame):
+    global tracking_active
+    if net is None:
+        return frame
+
+    height, width, _ = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+    net.setInput(blob)
+    outputs = net.forward()[0].T
+
+    boxes, scores = [], []
+    x_factor = width / 640.0
+    y_factor = height / 640.0
+
+    for row in outputs:
+        classes_scores = row[4:]
+        class_id = np.argmax(classes_scores)
+        confidence = classes_scores[class_id]
+
+        if class_id == 0 and confidence > 0.5:
+            cx, cy, w, h = row[0], row[1], row[2], row[3]
+            left = int((cx - w / 2) * x_factor)
+            top = int((cy - h / 2) * y_factor)
+            box_w = int(w * x_factor)
+            box_h = int(h * y_factor)
+
+            boxes.append([left, top, box_w, box_h])
+            scores.append(float(confidence))
+
+    indices = cv2.dnn.NMSBoxes(boxes, scores, 0.5, 0.4)
+
+    if len(indices) > 0:
+        # OpenCVのバージョン違いによる型エラーを完全に防ぐ安全な処理
+        if hasattr(indices, "flatten"):
+            indices = indices.flatten()
+        
+        idx = indices[0]
+        if isinstance(idx, (list, np.ndarray, tuple)):
+            idx = idx[0]
+            
+        x, y, w, h = boxes[int(idx)]
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(frame, "Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        if tracking_active:
+            control_drone_to_person(x, y, w, h, width, height)
+    elif tracking_active:
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except:
+            pass
+
+    return frame
+
+def control_drone_to_person(x, y, w, h, frame_width, frame_height):
     global tracking_active
     if not tracking_active:
         return
 
-    # 画面の中心座標
     center_x = frame_width // 2
-    center_y = frame_height // 2
+    person_center_x = x + w // 2
+    error_x = person_center_x - center_x
 
-    # 顔の中心座標
-    face_center_x = x + w // 2
-    face_center_y = y + h // 2
-
-    # 画面中心からのズレ（エラー値）
-    error_x = face_center_x - center_x
-    
-    # 簡易的な追従制御（デッドゾーンを設けて安定させる）
     yaw_speed = 0
     fb_speed = 0
 
-    # 左右のズレが大きい場合は旋回 (Yaw) で追う
     if abs(error_x) > 50:
-        yaw_speed = int(error_x * 0.2)  # ゲイン調整
-        yaw_speed = max(-30, min(30, yaw_speed)) # 速度制限
+        yaw_speed = int(error_x * 0.25)
+        yaw_speed = max(-35, min(35, yaw_speed))
 
-    # 顔の大きさ（面積）で距離を調整（近すぎたら後退、遠すぎたら前進）
-    face_area = w * h
-    target_area = 30000  # 理想の顔面積目安
-    if face_area < target_area * 0.8:
-        fb_speed = 15   # 前進
-    elif face_area > target_area * 1.2:
-        fb_speed = -15  # 後退
+    person_area = w * h
+    target_area = 50000
+    if person_area < target_area * 0.8:
+        fb_speed = 15
+    elif person_area > target_area * 1.2:
+        fb_speed = -15
 
-    # PCからの安全な操作（追跡が有効な間のみRC信号を送る）
-    if tracking_active:
+    try:
         tello.send_rc_control(0, fb_speed, 0, yaw_speed)
+    except:
+        pass
 
 def generate_frames():
-    global tracking_active
     while True:
-        frame = tello.get_frame_read().frame
-        if frame is None:
+        try:
+            frame_read = tello.get_frame_read()
+            if frame_read is None:
+                time.sleep(0.05)
+                continue
+            
+            frame = frame_read.frame
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            frame = detect_and_track_person(frame)
+
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        except Exception as e:
+            time.sleep(0.05)
             continue
-
-        height, width, _ = frame.shape
-        detector.setInputSize((width, height))
-        
-        _, faces = detector.detect(frame)
-        
-        if faces is not None and len(faces) > 0:
-            # 最も手前（最初）の顔をターゲットにする
-            face = faces[0]
-            box = list(map(int, face[:4]))
-            x, y, w, h = box[0], box[1], box[2], box[3]
-
-            # 画面に枠を描画
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            # 追跡承認されている場合のみドローンを動かす
-            if tracking_active:
-                control_drone_to_face(x, y, w, h, width, height)
-        else:
-            # 顔が見つからないかつ追跡中の場合は停止ホバリング
-            if tracking_active:
-                tello.send_rc_control(0, 0, 0, 0)
-
-        # 映像をJPEGに変換してストリーミング
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-# --- ルーティング ---
 
 @app.route('/video_feed')
 def video_feed():
@@ -110,37 +143,65 @@ def command():
     data = request.json
     cmd = data.get('cmd')
     
-    if cmd == 'takeoff':
-        tello.takeoff()
-    elif cmd == 'land':
-        tracking_active = False  # 着陸時は自動追跡を強制解除
-        tello.land()
-    elif cmd == 'start_tracking':
-        tracking_active = True   # PC画面からの承認で追跡開始
-    elif cmd == 'stop_tracking':
-        tracking_active = False  # 追跡停止（ドローンはその場でホバリング）
-        tello.send_rc_control(0, 0, 0, 0)
-    elif cmd == 'emergency':
-        tracking_active = False
-        tello.emergency()
-    # 通常の手動移動コマンド（実行時は安全のため一度停止信号を挟む等も可能）
-    elif cmd == 'up': tello.move_up(30)
-    elif cmd == 'down': tello.move_down(30)
-    elif cmd == 'forward': tello.move_forward(30)
-    elif cmd == 'back': tello.move_back(30)
-    elif cmd == 'left': tello.move_left(30)
-    elif cmd == 'right': tello.move_right(30)
-    elif cmd == 'cw': tello.rotate_clockwise(30)
-    elif cmd == 'ccw': tello.rotate_counter_clockwise(30)
+    try:
+        if cmd == 'takeoff':
+            tello.takeoff()
+        elif cmd == 'land':
+            tracking_active = False
+            tello.land()
+        elif cmd == 'start_tracking':
+            tracking_active = True
+        elif cmd == 'stop_tracking':
+            tracking_active = False
+            tello.send_rc_control(0, 0, 0, 0)
+        elif cmd == 'emergency':
+            tracking_active = False
+            tello.emergency()
+        elif cmd == 'flip':
+            tello.flip_forward() # 一回転（前転）
+        elif cmd == 'up': tello.move_up(30)
+        elif cmd == 'down': tello.move_down(30)
+        elif cmd == 'forward': tello.move_forward(30)
+        elif cmd == 'back': tello.move_back(30)
+        elif cmd == 'left': tello.move_left(30)
+        elif cmd == 'right': tello.move_right(30)
+        elif cmd == 'cw': tello.rotate_clockwise(30)
+        elif cmd == 'ccw': tello.rotate_counter_clockwise(30)
+    except Exception as e:
+        print(f"コマンド実行エラー: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
         
     return jsonify({"status": "ok", "command": cmd, "tracking": tracking_active})
 
+# --- 写真撮影用のエンドポイント ---
+@app.route('/snapshot', methods=['POST'])
+def snapshot():
+    try:
+        frame_read = tello.get_frame_read()
+        if frame_read is not None:
+            frame = frame_read.frame
+            if frame is not None:
+                filename = f"snapshot_{int(time.time())}.jpg"
+                cv2.imwrite(filename, frame)
+                print(f"写真を保存しました: {filename}")
+                return jsonify({"status": "ok", "filename": filename})
+    except Exception as e:
+        print(f"写真撮影エラー: {e}")
+    return jsonify({"status": "error", "message": "Failed to capture frame"})
+
 @app.route('/telemetry')
 def telemetry():
+    try:
+        battery = tello.get_battery()
+        height = tello.get_height()
+        temp = tello.get_temperature()
+    except:
+        battery, height, temp = 0, 0, 0
+
     return jsonify({
-        "battery": tello.get_battery(),
-        "height": tello.get_height(),
-        "temp": tello.get_temperature(),
+        "battery": battery,
+        "height": height,
+        "temp": temp,
         "tracking": tracking_active
     })
 
