@@ -131,7 +131,6 @@ def control_drone_to_person(x, y, w, h, frame_width, frame_height):
     # 人のバウンディングボックスの面積（幅 × 高さ）
     person_area = w * h
 
-    # 【デバッグ用】VS Codeのターミナルに現在の状態を表示
     print(f"[追跡中] 左右ズレ(error_x): {error_x} | 人の面積(area): {person_area}")
 
     yaw_speed = 0
@@ -146,13 +145,11 @@ def control_drone_to_person(x, y, w, h, frame_width, frame_height):
     if abs(error_x) > 40:
         yaw_speed = pid_control(error_x)
         yaw_speed = max(-25, min(25, yaw_speed))
-
-    # 距離の調整（人物の面積基準。小さすぎたら前進、大きすぎたら後退）
-    # ※もしドローンが動かない場合は、この target_area の数値を調整します
-    safe_area = 110000
-    landing_area = 100000
+    # 数値を変える
+    safe_area = 180000
+    landing_area = 600000
     if person_area < safe_area:
-        fb_speed = 10
+        fb_speed = 30
     elif person_area >= landing_area:
         print("近すぎるため着陸")
         tracking_active = False
@@ -230,6 +227,10 @@ def command():
         elif cmd == 'right': tello.move_right(30)
         elif cmd == 'cw': tello.rotate_clockwise(30)
         elif cmd == 'ccw': tello.rotate_counter_clockwise(30)
+        elif cmd == 'Fflip':tello.flip_back()
+        elif cmd == 'Lflip':tello.flip_left()
+        elif cmd == 'Rflip':tello.flip_right()
+        elif cmd == 'spin':tello.rotate_clockwise(360)
     except Exception as e:
         print(f"コマンド実行エラー: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
